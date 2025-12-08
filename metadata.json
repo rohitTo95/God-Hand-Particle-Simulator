@@ -1,0 +1,7 @@
+{
+  "name": "God's Hand - Particle Universe",
+  "description": "Control a 3D particle universe with real-time hand gestures. Create planets, trigger explosions, and shape the cosmos.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
