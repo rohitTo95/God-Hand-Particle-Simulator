@@ -4,21 +4,20 @@ import { OrbitControls, Stars } from '@react-three/drei';
 import ParticleSystem from './components/ParticleSystem';
 import HandTracker from './components/HandTracker';
 import UIOverlay from './components/UIOverlay';
-import { useStore } from './store';
 
 const SceneContent: React.FC = () => {
     return (
         <>
-            <ambientLight intensity={0.5} />
-            <pointLight position={[10, 10, 10]} intensity={1} />
-            <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
+            <ambientLight intensity={0.9} />
+            <pointLight position={[10, 10, 10]} intensity={10} />
+            <Stars radius={100} depth={50} count={1000} factor={4} saturation={0} fade={true} speed={1} />
             <ParticleSystem />
             <OrbitControls 
                 enablePan={false} 
                 minDistance={10} 
                 maxDistance={100} 
-                autoRotate={false}
-                autoRotateSpeed={0.5}
+                autoRotate={true}
+                autoRotateSpeed={0.6}
             />
             {/* Visual guide for center */}
             <mesh visible={false}>

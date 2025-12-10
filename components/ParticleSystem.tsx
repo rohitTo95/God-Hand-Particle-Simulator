@@ -64,42 +64,47 @@ const ParticleSystem: React.FC = () => {
   useFrame((state, delta) => {
     if (!pointsRef.current) return;
     
-    const { left, right, gesture, centerX, centerY, distance, rotation } = handDataRef.current;
+    const { left, right, gesture, centerX, centerY, centerZ, distance, rotation } = handDataRef.current;
     const s = simState.current;
     s.time += delta;
 
+    // Clamp delta to prevent physics explosions on frame drops
+    const clampedDelta = Math.min(delta, 0.05);
+
     // --- SYSTEM TRANSFORMS (CONTROL MODE) ---
     if (gesture === 'CONTROL') {
-        // Zoom: Map distance to scale. 
-        // Base distance approx 10. Range 5-20.
-        // Scale 0.5 to 2.0
-        const scaleFactor = Math.min(Math.max(distance / 10, 0.3), 3.0);
-        s.targetScale = scaleFactor;
+        // Zoom: Map distance to scale with better responsiveness
+        // Distance typically ranges from 5-20 units
+        const normalizedDist = (distance - 5) / 15; // 0 to 1 range
+        const scaleFactor = 0.4 + normalizedDist * 2.2; // 0.4 to 2.6 range
+        s.targetScale = Math.max(0.3, Math.min(3.0, scaleFactor));
         
-        // Rotation Y: Map centerX (-15 to 15) to rotation (-PI to PI)
-        s.targetRotationY = (centerX / 15) * Math.PI;
+        // Rotation Y: Map centerX with deadzone for stability
+        const deadzone = 1.5;
+        let rotY = 0;
+        if (Math.abs(centerX) > deadzone) {
+            rotY = ((centerX - Math.sign(centerX) * deadzone) / 12) * Math.PI;
+        }
+        s.targetRotationY = Math.max(-Math.PI, Math.min(Math.PI, rotY));
 
-        // Rotation Z (Steering): Map rotation angle directly
-        // Usually steering is -PI/2 to PI/2
-        s.targetRotationZ = rotation;
+        // Rotation Z (Steering): Map rotation angle with smoothing
+        s.targetRotationZ = rotation * 0.8; // Slightly dampen for stability
     }
 
-    // Smooth Interpolation for Transforms
-    const lerpFactor = delta * 5;
-    s.currentScale += (s.targetScale - s.currentScale) * lerpFactor;
-    s.currentRotationY += (s.targetRotationY - s.currentRotationY) * lerpFactor;
-    s.currentRotationZ += (s.targetRotationZ - s.currentRotationZ) * lerpFactor;
+    // Smooth Interpolation for Transforms with adaptive speed
+    const baseLerp = clampedDelta * 4;
+    const controlLerp = gesture === 'CONTROL' ? baseLerp * 1.5 : baseLerp * 0.5;
+    
+    s.currentScale += (s.targetScale - s.currentScale) * controlLerp;
+    s.currentRotationY += (s.targetRotationY - s.currentRotationY) * controlLerp;
+    s.currentRotationZ += (s.targetRotationZ - s.currentRotationZ) * controlLerp;
 
     // Apply Transforms to Group
     pointsRef.current.scale.setScalar(s.currentScale);
     pointsRef.current.rotation.y = s.currentRotationY;
     pointsRef.current.rotation.z = s.currentRotationZ;
-    // We can also rotate X based on centerY, but let's keep it simple (Orbit Y + Roll Z)
 
     // --- PHYSICS PREP ---
-    // We need to transform Hand Coordinates (World Space) into Local Space of the particle system
-    // because the particles are being simulated in their local space (positions array).
-    
     const worldToLocalMatrix = pointsRef.current.matrixWorld.clone().invert();
     
     const getLocalHandPos = (h: {x:number, y:number, z:number}) => {
@@ -109,34 +114,50 @@ const ParticleSystem: React.FC = () => {
     
     const lPos = left ? getLocalHandPos(left) : null;
     const rPos = right ? getLocalHandPos(right) : null;
-    const centerPos = getLocalHandPos({x: centerX, y: centerY, z: 0});
+    const centerPos = getLocalHandPos({x: centerX, y: centerY, z: centerZ || 0});
+
+    // Dynamic interaction radius based on current scale
+    const baseInteractionRadius = 12;
+    const interactionRadius = baseInteractionRadius / s.currentScale;
 
     // --- GAME LOGIC ---
 
-    // Gesture Triggers
-    if (gesture === 'COLLAPSE' && s.time - s.explosionTime > 1.0) {
-      s.explosionTime = s.time;
-      s.planetMode = false; // Break planet
-    }
+    // CIRCLE/Planet mode activation
     if (gesture === 'CIRCLE' && !s.planetMode) {
         s.planetMode = true;
         s.planetCenter.copy(centerPos);
     }
-    // If hands move far apart, break planet mode
-    if (gesture === 'EXPAND' && s.planetMode) {
-        s.planetMode = false;
+    
+    // Update planet center smoothly while in CIRCLE mode
+    if (gesture === 'CIRCLE' && s.planetMode) {
+        s.planetCenter.lerp(centerPos, clampedDelta * 4);
+    }
+    
+    // Exit planet mode when not in CIRCLE gesture
+    if (gesture !== 'CIRCLE' && s.planetMode) {
+        // Give a short grace period before exiting
+        if (gesture === 'EXPAND' || gesture === 'COMPRESS') {
+            s.planetMode = false;
+        }
+    }
+
+    // Explosion trigger
+    if (gesture === 'COLLAPSE' && s.time - s.explosionTime > 1.5) {
+      s.explosionTime = s.time;
+      s.planetMode = false;
     }
     
     const explosionAge = s.time - s.explosionTime;
-    const isExploding = explosionAge < 1.5 && explosionAge > 0;
+    const isExploding = explosionAge < 2.0 && explosionAge > 0;
 
     // --- PARTICLE LOOP ---
-    // Physics constants
     const damping = config.friction;
-    const returnForce = 0.5 * delta;
+    const returnForce = 0.5 * clampedDelta;
     
-    // Check if hands are "active" for physics (Open hands only)
-    const isPhysicsActive = gesture !== 'CONTROL'; 
+    // Check if either hand is pinched
+    const leftPinched = left?.isPinched ?? false;
+    const rightPinched = right?.isPinched ?? false;
+    const anyPinched = leftPinched || rightPinched;
 
     const posAttr = pointsRef.current.geometry.attributes.position;
     
@@ -155,122 +176,195 @@ const ParticleSystem: React.FC = () => {
       vy *= damping;
       vz *= damping;
 
-      // 2. Shape Holding Force
-      if (!s.planetMode && !isExploding) {
+      // 2. Shape Holding Force (only when IDLE, not during active gestures)
+      if (!s.planetMode && !isExploding && gesture === 'IDLE') {
           const tx = originalPositions[idx];
           const ty = originalPositions[idx + 1];
           const tz = originalPositions[idx + 2];
-          vx += (tx - px) * returnForce * 0.5;
-          vy += (ty - py) * returnForce * 0.5;
-          vz += (tz - pz) * returnForce * 0.5;
+          vx += (tx - px) * returnForce * 0.6;
+          vy += (ty - py) * returnForce * 0.6;
+          vz += (tz - pz) * returnForce * 0.6;
       }
 
-      // 3. Hand Influence (Only if Physics Active)
-      if (isPhysicsActive) {
-          // Left Hand
-          if (lPos) {
-            const dx = lPos.x - px;
-            const dy = lPos.y - py;
-            const dz = lPos.z - pz;
-            const d2 = dx*dx + dy*dy + dz*dz + 0.1;
-            const d = Math.sqrt(d2);
-            
-            const force = left!.isOpen ? -10.0 : 30.0; 
-            
-            // Adjust interaction radius for scale? 
-            // Since we transformed hand to local space, interaction radius should be in local units (approx 8)
-            if (d < 8) {
-                const f = (force * delta) / d;
-                vx += dx * f;
-                vy += dy * f;
-                vz += dz * f;
-            }
-          }
-          
-          // Right Hand
-          if (rPos) {
-            const dx = rPos.x - px;
-            const dy = rPos.y - py;
-            const dz = rPos.z - pz;
-            const d2 = dx*dx + dy*dy + dz*dz + 0.1;
-            const d = Math.sqrt(d2);
-            
-            const force = right!.isOpen ? -10.0 : 30.0;
-            
-            if (d < 8) {
-                const f = (force * delta) / d;
-                vx += dx * f;
-                vy += dy * f;
-                vz += dz * f;
-            }
-          }
-      }
-
-      // 4. Gesture Effects
-      
-      // PLANET MODE
-      if (s.planetMode) {
-        const dx = s.planetCenter.x - px;
-        const dy = s.planetCenter.y - py;
-        const dz = s.planetCenter.z - pz;
-        const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      // 3. PLANET MODE - Create a proper 3D FILLED SPHERE
+      if (s.planetMode && gesture === 'CIRCLE') {
+        // Planet center - use X,Y from hands, Z at scene center
+        const planetX = s.planetCenter.x;
+        const planetY = s.planetCenter.y;
+        const planetZ = 0;
         
-        const gForce = (150 * delta) / (d + 1);
-        vx += (dx / d) * gForce;
-        vy += (dy / d) * gForce;
-        vz += (dz / d) * gForce;
-
-        const swirlSpeed = 20 * delta / (d + 0.5);
-        vx += -dz * swirlSpeed;
-        vz += dx * swirlSpeed;
-      }
-
-      // EXPAND / COMPRESS
-      if (!s.planetMode && isPhysicsActive) {
-          if (gesture === 'EXPAND') {
-             const dx = px - centerPos.x;
-             const dy = py - centerPos.y;
-             const dz = pz - centerPos.z;
-             const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
-             const factor = 20 * delta / d;
-             vx += dx * factor;
-             vy += dy * factor;
-             vz += dz * factor;
-          } else if (gesture === 'COMPRESS') {
-             const dx = centerPos.x - px;
-             const dy = centerPos.y - py;
-             const dz = centerPos.z - pz;
-             const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
-             const factor = 15 * delta / d;
-             vx += dx * factor;
-             vy += dy * factor;
-             vz += dz * factor;
+        const dx = planetX - px;
+        const dy = planetY - py;
+        const dz = planetZ - pz;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.001;
+        
+        // Target sphere radius
+        const targetRadius = 5;
+        
+        // Calculate where this particle should be distributed within the sphere
+        // Use particle index to create unique target positions for volume fill
+        const particlePhase = (i * 2.399) % (Math.PI * 2); // Golden angle spread
+        const particleLayer = ((i * 0.618) % 1.0); // Golden ratio for layers
+        
+        // MAIN GRAVITATIONAL PULL - Always pull toward center
+        const pullStrength = 200 * clampedDelta;
+        const pullForce = pullStrength / (d + 0.5);
+        
+        vx += (dx / d) * pullForce;
+        vy += (dy / d) * pullForce;
+        vz += (dz / d) * pullForce;
+        
+        // SPHERE VOLUME DISTRIBUTION
+        // Push particles to fill the volume, not just the surface
+        if (d < targetRadius) {
+          // Inside the sphere - apply gentle random forces to distribute
+          const distributeForce = 5 * clampedDelta;
+          
+          // Random direction based on particle ID for consistent distribution
+          const randX = Math.sin(i * 1.1 + s.time * 0.5);
+          const randY = Math.cos(i * 1.3 + s.time * 0.3);
+          const randZ = Math.sin(i * 1.7 + s.time * 0.4);
+          
+          vx += randX * distributeForce;
+          vy += randY * distributeForce;
+          vz += randZ * distributeForce;
+          
+          // Push away from center if too close (prevent point collapse)
+          if (d < targetRadius * 0.2) {
+            const pushOut = 30 * clampedDelta;
+            vx -= (dx / d) * pushOut;
+            vy -= (dy / d) * pushOut;
+            vz -= (dz / d) * pushOut;
           }
+        } else {
+          // Outside the sphere - pull in faster
+          const extraPull = 100 * clampedDelta / (d + 1);
+          vx += (dx / d) * extraPull;
+          vy += (dy / d) * extraPull;
+          vz += (dz / d) * extraPull;
+        }
+        
+        // GENTLE SWIRL - much slower, just for visual appeal, won't create ring
+        const gentleSwirl = 3 * clampedDelta;
+        vx += -dy * gentleSwirl * 0.1;
+        vy += dx * gentleSwirl * 0.1;
+        
+        // Z-AXIS SPREAD - push particles into Z depth to prevent flat plane
+        const zSpread = (Math.sin(i * 0.1 + s.time) * 0.5 + 0.5) * targetRadius;
+        const targetZ = planetZ + (zSpread - targetRadius * 0.5);
+        const zDiff = targetZ - pz;
+        vz += zDiff * 3 * clampedDelta;
+        
+        // Add controlled noise for organic look
+        const noise = 2 * clampedDelta;
+        vx += (Math.random() - 0.5) * noise;
+        vy += (Math.random() - 0.5) * noise;
+        vz += (Math.random() - 0.5) * noise;
+      }
+      // 4. COMPRESS - Pull particles toward hand positions when pinching
+      else if (gesture === 'COMPRESS' && anyPinched) {
+        // Pull toward the center point between hands (or single hand)
+        const dx = centerPos.x - px;
+        const dy = centerPos.y - py;
+        const dz = centerPos.z - pz;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+        
+        const pullForce = 50 * clampedDelta / (d + 0.3);
+        vx += dx * pullForce;
+        vy += dy * pullForce;
+        vz += dz * pullForce;
+      }
+      // 5. EXPAND - Scatter particles outward when releasing pinch
+      else if (gesture === 'EXPAND') {
+        const dx = px - centerPos.x;
+        const dy = py - centerPos.y;
+        const dz = pz - centerPos.z;
+        const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+        
+        const pushForce = 35 * clampedDelta;
+        vx += (dx / d) * pushForce;
+        vy += (dy / d) * pushForce;
+        vz += (dz / d) * pushForce;
+        
+        // Add some randomness for scatter effect
+        vx += (Math.random() - 0.5) * 15 * clampedDelta;
+        vy += (Math.random() - 0.5) * 15 * clampedDelta;
+        vz += (Math.random() - 0.5) * 15 * clampedDelta;
+      }
+      // 6. Hand influence during IDLE (subtle interaction)
+      else if (gesture === 'IDLE') {
+        // Left Hand interaction
+        if (lPos) {
+          const dx = lPos.x - px;
+          const dy = lPos.y - py;
+          const dz = lPos.z - pz;
+          const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+          
+          if (d < interactionRadius) {
+            // Pinched = attract, Open = gentle repel
+            const baseForce = leftPinched ? 25.0 : -8.0;
+            const falloff = Math.max(0, 1 - (d / interactionRadius));
+            const f = (baseForce * falloff * clampedDelta) / (d + 0.3);
+            vx += dx * f;
+            vy += dy * f;
+            vz += dz * f;
+          }
+        }
+        
+        // Right Hand interaction
+        if (rPos) {
+          const dx = rPos.x - px;
+          const dy = rPos.y - py;
+          const dz = rPos.z - pz;
+          const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+          
+          if (d < interactionRadius) {
+            const baseForce = rightPinched ? 25.0 : -8.0;
+            const falloff = Math.max(0, 1 - (d / interactionRadius));
+            const f = (baseForce * falloff * clampedDelta) / (d + 0.3);
+            vx += dx * f;
+            vy += dy * f;
+            vz += dz * f;
+          }
+        }
       }
 
-      // EXPLOSION
+      // 7. EXPLOSION effect
       if (isExploding) {
           const dx = px - centerPos.x;
           const dy = py - centerPos.y;
           const dz = pz - centerPos.z;
           const d = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.001;
           
-          const waveRadius = explosionAge * 30;
+          const waveRadius = explosionAge * 25;
+          const waveWidth = 6;
           const distToWave = Math.abs(d - waveRadius);
           
-          if (distToWave < 5) {
-              const blast = (100 * delta) / (d + 1);
+          if (distToWave < waveWidth) {
+              const waveFalloff = 1 - (distToWave / waveWidth);
+              const blast = (120 * clampedDelta * waveFalloff) / (d + 0.5);
               vx += (dx/d) * blast;
               vy += (dy/d) * blast;
               vz += (dz/d) * blast;
               
-              vx += (Math.random()-0.5) * 50 * delta;
-              vy += (Math.random()-0.5) * 50 * delta;
-              vz += (Math.random()-0.5) * 50 * delta;
+              const turbulence = 40 * clampedDelta * waveFalloff;
+              vx += (Math.random()-0.5) * turbulence;
+              vy += (Math.random()-0.5) * turbulence;
+              vz += (Math.random()-0.5) * turbulence;
           }
       }
 
-      // Update
+      // Velocity clamping
+      const maxVel = 2.5;
+      const velMag = Math.sqrt(vx*vx + vy*vy + vz*vz);
+      if (velMag > maxVel) {
+          const scale = maxVel / velMag;
+          vx *= scale;
+          vy *= scale;
+          vz *= scale;
+      }
+
+      // Update positions
       px += vx;
       py += vy;
       pz += vz;

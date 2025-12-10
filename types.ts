@@ -21,8 +21,8 @@ export interface ParticleConfig {
 }
 
 export interface HandData {
-  left: { x: number; y: number; z: number; isOpen: boolean } | null;
-  right: { x: number; y: number; z: number; isOpen: boolean } | null;
+  left: { x: number; y: number; z: number; isOpen: boolean; isPinched: boolean } | null;
+  right: { x: number; y: number; z: number; isOpen: boolean; isPinched: boolean } | null;
   distance: number; // Distance between hands
   centerX: number;
   centerY: number;

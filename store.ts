@@ -12,9 +12,9 @@ interface AppState {
 }
 
 const DEFAULT_CONFIG: ParticleConfig = {
-  count: 8000,
+  count: 200000,
   color: '#00ffff',
-  size: 0.15,
+  size: 0.05,
   gravityStrength: 0.5,
   friction: 0.96,
   shape: ShapeType.SPHERE,
